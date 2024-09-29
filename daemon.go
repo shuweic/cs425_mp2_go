@@ -14,14 +14,16 @@ import (
 )
 
 const (
-	Ping               = 0x01
-	Ack                = 0x01 << 1
-	MemInitRequest     = 0x01 << 2
-	MemInitReply       = 0x01 << 3
-	MemUpdateSuspect   = 0x01 << 4
-	MemUpdateResume    = 0x01 << 5
-	MemUpdateLeave     = 0x01 << 6
-	MemUpdateJoin      = 0x01 << 7
+	Ping             = 0x01
+	Ack              = 0x01 << 1
+	MemInitRequest   = 0x01 << 2
+	MemInitReply     = 0x01 << 3
+	MemUpdateSuspect = 0x01 << 4
+	MemUpdateResume  = 0x01 << 5
+	MemUpdateLeave   = 0x01 << 6
+	MemUpdateJoin    = 0x01 << 7
+	FlagUpdate       = 0x11
+
 	StateAlive         = 0x01
 	StateSuspect       = 0x01 << 1
 	StateMonit         = 0x01 << 2
@@ -167,12 +169,12 @@ func udpDaemon() {
 		case "enable_sus":
 			suspectOn = true
 			fmt.Println("Suspicion mechanism enabled.")
-			// broadcastFlagChange(suspectOn)
+			broadcastFlagChange(suspectOn)
 
 		case "disable_sus":
 			suspectOn = false
 			fmt.Println("Suspicion mechanism disabled.")
-			// broadcastFlagChange(suspectOn)
+			broadcastFlagChange(suspectOn)
 
 		case "status_sus":
 			if suspectOn {
@@ -313,16 +315,26 @@ func udpDaemonHandle(connect *net.UDPConn) {
 				initReply(addr.IP.String(), header.Seq, payload)
 
 			} else if header.Type&MemUpdateSuspect != 0 {
-				Logger.Info("Handle suspect update sent from %s\n", addr.IP.String())
-				handleSuspect(payload)
-				// Get update entry from TTL Cache
-				update, flag, err := getUpdate()
-				// if no update there, do pure ping
-				if err != nil {
-					ack(addr.IP.String(), header.Seq, reserved)
-				} else {
-					// Send update as payload of ping
-					ackWithPayload(addr.IP.String(), header.Seq, update, flag, reserved)
+				reserved := uint8(0x00)
+				// 检查是否是怀疑更新消息，并且是否需要进入怀疑机制
+				if header.Type&MemUpdateSuspect != 0 {
+					// 如果怀疑机制被禁用，直接将节点标记为失败
+					if !suspectOn {
+						Logger.Info("Skipping suspicion mechanism and marking node as failed")
+						handleLeave(payload) // 将节点标记为失败
+					} else {
+						Logger.Info("Handle suspect update sent from %s\n", addr.IP.String())
+						handleSuspect(payload)
+						// Get update entry from TTL Cache
+						update, flag, err := getUpdate()
+						// if no update there, do pure ping
+						if err != nil {
+							ack(addr.IP.String(), header.Seq, reserved)
+						} else {
+							// Send update as payload of ping
+							ackWithPayload(addr.IP.String(), header.Seq, update, flag, reserved)
+						}
+					}
 				}
 
 			} else if header.Type&MemUpdateResume != 0 {
@@ -371,6 +383,10 @@ func udpDaemonHandle(connect *net.UDPConn) {
 				// If no, simply reply with ack
 				ack(addr.IP.String(), header.Seq, reserved)
 			}
+
+		} else if header.Type&FlagUpdate != 0 {
+
+			handleFlagUpdate(payload)
 
 		} else if header.Type&Ack != 0 {
 
@@ -673,14 +689,26 @@ func pingWithPayload(member *Member, payload []byte, flag uint8) {
 	go func() {
 		<-timer.C
 		Logger.Info("Ping (%s, %d) timeout\n", addr, seq)
-		err := CurrentList.Update(member.TimeStamp, member.IP, StateSuspect)
-		if err == nil {
-			fmt.Printf("[SUSPECTED NODE] Node with IP: %s and Timestamp: %d is suspected by this node\n",
+
+		if !suspectOn {
+			fmt.Printf("[FAILURE DETECTED] Node with IP: %s and Timestamp: %d is marked as failed directly.\n",
 				int2ip(member.IP).String(), member.TimeStamp)
-			Logger.Info("[SUSPECTED NODE] Node with IP: %s and Timestamp: %d is suspected by this node\n",
+			Logger.Info("[FAILURE DETECTED] Node with IP: %s and Timestamp: %d is marked as failed directly.\n",
 				int2ip(member.IP).String(), member.TimeStamp)
-			addUpdate2Cache(member, MemUpdateSuspect)
+			err := CurrentList.Delete(member.TimeStamp, member.IP)
+			printError(err)
+		} else {
+			// 怀疑机制开启时，标记节点为 Suspect，并进入怀疑检测流程
+			err := CurrentList.Update(member.TimeStamp, member.IP, StateSuspect)
+			if err == nil {
+				fmt.Printf("[SUSPECTED NODE] Node with IP: %s and Timestamp: %d is suspected by this node\n",
+					int2ip(member.IP).String(), member.TimeStamp)
+				Logger.Info("[SUSPECTED NODE] Node with IP: %s and Timestamp: %d is suspected by this node\n",
+					int2ip(member.IP).String(), member.TimeStamp)
+				addUpdate2Cache(member, MemUpdateSuspect)
+			}
 		}
+
 		delete(PingAckTimeout, uint16(seq))
 		// Handle local suspect timeout
 		failure_timer := time.NewTimer(SuspectPeriod)
@@ -697,6 +725,58 @@ func pingWithPayload(member *Member, payload []byte, flag uint8) {
 
 func ping(member *Member) {
 	pingWithPayload(member, nil, 0x00)
+}
+
+// 广播怀疑机制状态变化
+func broadcastFlagChange(flagStatus bool) {
+	// 将状态转换为 uint8 (1 表示启用，0 表示禁用)
+	flagValue := uint8(0)
+	if flagStatus {
+		flagValue = 1
+	}
+
+	// 向所有其他成员广播 flag 更新消息
+	for _, member := range CurrentList.Members {
+		if member != nil && member.IP != CurrentMember.IP {
+			Logger.Info("Sending FlagUpdate to %s", int2ip(member.IP).String())
+			sendFlagUpdate(member, flagValue)
+		}
+	}
+}
+
+// 发送 FlagUpdate 消息
+func sendFlagUpdate(member *Member, flagValue uint8) {
+	// 构建 FlagUpdate 消息
+	update := Update{
+		UpdateID:        TTLCaches.RandGen.Uint64(),
+		TTL:             TTL_,
+		UpdateType:      FlagUpdate,
+		MemberTimeStamp: CurrentMember.TimeStamp,
+		MemberIP:        CurrentMember.IP,
+		MemberState:     flagValue, // 在 MemberState 中存储怀疑机制状态
+	}
+
+	// 发送 FlagUpdate 消息
+	var binBuffer bytes.Buffer
+	binary.Write(&binBuffer, binary.BigEndian, &update)
+	udpSend(int2ip(member.IP).String()+Port, binBuffer.Bytes())
+}
+
+// 处理 FlagUpdate 消息，更新怀疑机制状态
+func handleFlagUpdate(payload []byte) {
+	var update Update
+	buf := bytes.NewReader(payload)
+	err := binary.Read(buf, binary.BigEndian, &update)
+	printError(err)
+
+	// 更新怀疑机制状态
+	if update.MemberState == 1 {
+		suspectOn = true
+		fmt.Println("Suspicion mechanism enabled (received from another node).")
+	} else {
+		suspectOn = false
+		fmt.Println("Suspicion mechanism disabled (received from another node).")
+	}
 }
 
 // Start the membership service and join in the group
