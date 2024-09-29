@@ -173,8 +173,8 @@ func udpDaemon() {
 		default:
 			fmt.Println("Invalid Command, Please use correct one")
 			fmt.Println("# join")
-			fmt.Println("# showlist")
-			fmt.Println("# showid")
+			fmt.Println("# list_mem")
+			fmt.Println("# list_self")
 			fmt.Println("# leave")
 			fmt.Println("# enable_sus")
 			fmt.Println("# disable_sus")
