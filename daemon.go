@@ -392,10 +392,12 @@ func udpDaemonHandle(connect *net.UDPConn) {
 
 			// Receive Ack, stop ping timer
 			timer, ok := PingAckTimeout[header.Seq-1]
-			if ok {
+			if ok && timer != nil { // 确保计时器存在且不是 nil
 				timer.Stop()
 				Logger.Info("Receive ACK from [%s] with seq %d\n", addr.IP.String(), header.Seq)
 				delete(PingAckTimeout, header.Seq-1)
+			} else {
+				Logger.Debug("Attempted to stop a non-existent or nil timer for seq %d\n", header.Seq)
 			}
 
 			// Check header's reserved field
@@ -691,10 +693,13 @@ func pingWithPayload(member *Member, payload []byte, flag uint8) {
 		Logger.Info("Ping (%s, %d) timeout\n", addr, seq)
 
 		if !suspectOn {
+			// 怀疑机制关闭时，直接将节点标记为失败并删除
 			fmt.Printf("[FAILURE DETECTED] Node with IP: %s and Timestamp: %d is marked as failed directly.\n",
 				int2ip(member.IP).String(), member.TimeStamp)
 			Logger.Info("[FAILURE DETECTED] Node with IP: %s and Timestamp: %d is marked as failed directly.\n",
 				int2ip(member.IP).String(), member.TimeStamp)
+
+			// 删除该节点
 			err := CurrentList.Delete(member.TimeStamp, member.IP)
 			printError(err)
 		} else {
@@ -705,8 +710,26 @@ func pingWithPayload(member *Member, payload []byte, flag uint8) {
 					int2ip(member.IP).String(), member.TimeStamp)
 				Logger.Info("[SUSPECTED NODE] Node with IP: %s and Timestamp: %d is suspected by this node\n",
 					int2ip(member.IP).String(), member.TimeStamp)
+
+				// 将怀疑状态更新加入到 TTL 缓存并广播
 				addUpdate2Cache(member, MemUpdateSuspect)
 			}
+
+			// 设置一个本地怀疑超时计时器，超时后标记为失败
+			failure_timer := time.NewTimer(SuspectPeriod)
+			FailureTimeout[[2]uint64{member.TimeStamp, uint64(member.IP)}] = failure_timer
+			go func() {
+				// 等待怀疑超时
+				<-failure_timer.C
+				Logger.Info("[Failure Detected](%s, %d) Failed, detected by self\n", int2ip(member.IP).String(), member.TimeStamp)
+
+				// 删除节点
+				err := CurrentList.Delete(member.TimeStamp, member.IP)
+				printError(err)
+
+				// 清除超时记录
+				delete(FailureTimeout, [2]uint64{member.TimeStamp, uint64(member.IP)})
+			}()
 		}
 
 		delete(PingAckTimeout, uint16(seq))
