@@ -15,7 +15,7 @@ type ssmsLogger struct {
 // Return a new logger with argument filepath and identity str
 func NewSsmsLogger(id string) *ssmsLogger {
 	mylogger := ssmsLogger{}
-	file, _ := os.OpenFile("./ssms.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0766)
+	file, _ := os.OpenFile("./swim.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0766)
 	commonPrefix := "**" + id + "** "
 	prefix := "[INFO]: "
 	mylogger.infoLogger = log.New(file, prefix+commonPrefix, log.Ldate|log.Lmicroseconds)
