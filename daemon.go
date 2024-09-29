@@ -391,11 +391,11 @@ func udpDaemonHandle(connect *net.UDPConn) {
 		} else if header.Type&Ack != 0 {
 
 			// Receive Ack, stop ping timer
-			timer, ok := PingAckTimeout[header.Seq-1]
-			if ok && timer != nil { // 确保计时器存在且不是 nil
+			timer, ok := PingAckTimeout[header.Seq]
+			if ok && timer != nil {
 				timer.Stop()
 				Logger.Info("Receive ACK from [%s] with seq %d\n", addr.IP.String(), header.Seq)
-				delete(PingAckTimeout, header.Seq-1)
+				delete(PingAckTimeout, header.Seq)
 			} else {
 				Logger.Debug("Attempted to stop a non-existent or nil timer for seq %d\n", header.Seq)
 			}
@@ -651,16 +651,14 @@ func initRequest(member *Member) {
 }
 
 func ackWithPayload(addr string, seq uint16, payload []byte, flag uint8, reserved uint8) {
-	packet := Header{Ack | flag, seq + 1, reserved}
+	packet := Header{Ack | flag, seq, reserved}
 	var binBuffer bytes.Buffer
 	binary.Write(&binBuffer, binary.BigEndian, packet)
 
 	if payload != nil {
 		binBuffer.Write(payload) // Append payload
-		udpSend(addr+Port, binBuffer.Bytes())
-	} else {
-		udpSend(addr+Port, binBuffer.Bytes())
 	}
+	udpSend(addr+Port, binBuffer.Bytes())
 }
 
 func ack(addr string, seq uint16, reserved uint8) {
@@ -769,19 +767,23 @@ func broadcastFlagChange(flagStatus bool) {
 
 // 发送 FlagUpdate 消息
 func sendFlagUpdate(member *Member, flagValue uint8) {
-	// 构建 FlagUpdate 消息
+	// Construct the FlagUpdate message
 	update := Update{
 		UpdateID:        TTLCaches.RandGen.Uint64(),
 		TTL:             TTL_,
 		UpdateType:      FlagUpdate,
 		MemberTimeStamp: CurrentMember.TimeStamp,
 		MemberIP:        CurrentMember.IP,
-		MemberState:     flagValue, // 在 MemberState 中存储怀疑机制状态
+		MemberState:     flagValue, // Store suspicion mechanism status in MemberState
 	}
 
-	// 发送 FlagUpdate 消息
+	// Include a header in the message
+	packet := Header{FlagUpdate, 0, 0}
 	var binBuffer bytes.Buffer
+	binary.Write(&binBuffer, binary.BigEndian, packet)
 	binary.Write(&binBuffer, binary.BigEndian, &update)
+
+	// Send the FlagUpdate message
 	udpSend(int2ip(member.IP).String()+Port, binBuffer.Bytes())
 }
 
