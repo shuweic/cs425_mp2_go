@@ -22,6 +22,7 @@ const (
 	MemUpdateResume    = 0x01 << 5
 	MemUpdateLeave     = 0x01 << 6
 	MemUpdateJoin      = 0x01 << 7
+	FlagUpdate         = 0x00 << 1
 	StateAlive         = 0x01
 	StateSuspect       = 0x01 << 1
 	StateMonit         = 0x01 << 2
@@ -166,9 +167,20 @@ func udpDaemon() {
 			initiateLeave()
 		case "enable_sus":
 			suspectOn = true
+			fmt.Println("Suspicion mechanism enabled.")
+			broadcastFlagChange(suspectOn)
 
 		case "disable_sus":
 			suspectOn = false
+			fmt.Println("Suspicion mechanism disabled.")
+			broadcastFlagChange(suspectOn)
+
+		case "status_sus":
+			if suspectOn {
+				fmt.Println("Suspicion mechanism is enabled.")
+			} else {
+				fmt.Println("Suspicion mechanism is disabled.")
+			}
 
 		default:
 			fmt.Println("Invalid Command, Please use correct one")
@@ -178,6 +190,7 @@ func udpDaemon() {
 			fmt.Println("# leave")
 			fmt.Println("# enable_sus")
 			fmt.Println("# disable_sus")
+			fmt.Println("# status_sus")
 		}
 	}
 
@@ -279,6 +292,11 @@ func udpDaemonHandle(connect *net.UDPConn) {
 
 		// Read payload
 		payload := buffer[HeaderLength:n]
+
+		if header.Type&FlagUpdate != 0 {
+			// Handle FlagUpdate message
+			handleFlagUpdate(payload)
+		}
 
 		// Resume detection
 
@@ -456,6 +474,56 @@ func getUpdate() ([]byte, uint8, error) {
 
 	binary.Write(&binBuffer, binary.BigEndian, update)
 	return binBuffer.Bytes(), update.UpdateType, nil
+}
+
+func broadcastFlagChange(flagStatus bool) {
+	// Convert the flag status to an integer (1 for true, 0 for false)
+	flagValue := 0
+	if flagStatus {
+		flagValue = 1
+	}
+
+	// Prepare the message to send to all other VMs
+	for _, member := range CurrentList.Members {
+		if member != nil && member.IP != CurrentMember.IP {
+			// Only send the update to other members, not self
+			Logger.Info("Sending FlagUpdate to %s", int2ip(member.IP).String())
+			sendFlagUpdate(member, flagValue)
+		}
+	}
+}
+
+func sendFlagUpdate(member *Member, flagValue int) {
+	// Construct a message for the flag update
+	update := Update{
+		UpdateID:        TTLCaches.RandGen.Uint64(),
+		TTL:             TTL_,
+		UpdateType:      MemUpdateJoin, // Use MemUpdateJoin instead of FlagUpdate
+		MemberTimeStamp: CurrentMember.TimeStamp,
+		MemberIP:        CurrentMember.IP,
+		MemberState:     uint8(flagValue), // Store the flag status in the state field
+	}
+
+	// Send the flag update as a message
+	var binBuffer bytes.Buffer
+	binary.Write(&binBuffer, binary.BigEndian, &update)
+	udpSend(int2ip(member.IP).String()+Port, binBuffer.Bytes())
+}
+
+func handleFlagUpdate(payload []byte) {
+	var update Update
+	buf := bytes.NewReader(payload)
+	err := binary.Read(buf, binary.BigEndian, &update)
+	printError(err)
+
+	// Apply the flag update (1 for true, 0 for false)
+	if update.MemberState == 1 {
+		suspectOn = true
+		fmt.Println("Suspicion mechanism enabled (received from another VM).")
+	} else {
+		suspectOn = false
+		fmt.Println("Suspicion mechanism disabled (received from another VM).")
+	}
 }
 
 func handleSuspect(payload []byte) {
