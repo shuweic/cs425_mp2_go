@@ -14,15 +14,15 @@ import (
 )
 
 const (
-	Ping             = 0x01
-	Ack              = 0x01 << 1
-	MemInitRequest   = 0x01 << 2
-	MemInitReply     = 0x01 << 3
-	MemUpdateSuspect = 0x01 << 4
-	MemUpdateResume  = 0x01 << 5
-	MemUpdateLeave   = 0x01 << 6
-	MemUpdateJoin    = 0x01 << 7
-	FlagUpdate       = 0x11
+	Ping             = 1
+	Ack              = 2
+	MemInitRequest   = 3
+	MemInitReply     = 4
+	MemUpdateSuspect = 5
+	MemUpdateResume  = 6
+	MemUpdateLeave   = 7
+	MemUpdateJoin    = 8
+	FlagUpdate       = 9
 
 	StateAlive         = 0x01
 	StateSuspect       = 0x01 << 1
@@ -295,29 +295,28 @@ func udpDaemonHandle(connect *net.UDPConn) {
 		payload := buffer[HeaderLength:n]
 
 		// Resume detection
-
-		if header.Type&Ping != 0 {
-
+		switch header.Type {
+		case Ping:
 			reserved := uint8(0x00)
 			// Check whether this ping's source IP is within the memberlist
 			// IF not, set reserved 0xff, ask for sender's join update
 			// init request will not participate this procedure
 			// Because every new join member is unknown to the introducer
-			if (!CurrentList.ContainsIP(ip2int(addr.IP))) && (header.Type&MemInitRequest == 0) {
+			if (!CurrentList.ContainsIP(ip2int(addr.IP))) && (header.Type == MemInitRequest) {
 				reserved = 0xff
 				Logger.Info("Receive ping from unknown member, set reserved field 0xff")
 			}
 
 			// Check whether this ping carries Init Request
-			if header.Type&MemInitRequest != 0 {
+			if header.Type == MemInitRequest {
 				// Handle Init Request
 				Logger.Info("Receive Init Request from %s: with seq %d\n", addr.IP.String(), header.Seq)
 				initReply(addr.IP.String(), header.Seq, payload)
 
-			} else if header.Type&MemUpdateSuspect != 0 {
+			} else if header.Type == MemUpdateSuspect {
 				reserved := uint8(0x00)
 				// 检查是否是怀疑更新消息，并且是否需要进入怀疑机制
-				if header.Type&MemUpdateSuspect != 0 {
+				if header.Type == MemUpdateSuspect {
 					// 如果怀疑机制被禁用，直接将节点标记为失败
 					if !suspectOn {
 						Logger.Info("Skipping suspicion mechanism and marking node as failed")
@@ -337,7 +336,7 @@ func udpDaemonHandle(connect *net.UDPConn) {
 					}
 				}
 
-			} else if header.Type&MemUpdateResume != 0 {
+			} else if header.Type == MemUpdateResume {
 				Logger.Info("Handle resume update sent from %s\n", addr.IP.String())
 				handleResume(payload)
 				// Get update entry from TTL Cache
@@ -350,7 +349,7 @@ func udpDaemonHandle(connect *net.UDPConn) {
 					ackWithPayload(addr.IP.String(), header.Seq, update, flag, reserved)
 				}
 
-			} else if header.Type&MemUpdateLeave != 0 {
+			} else if header.Type == MemUpdateLeave {
 				Logger.Info("Handle leave update sent from %s\n", addr.IP.String())
 				handleLeave(payload)
 				// Get update entry from TTL Cache
@@ -363,7 +362,7 @@ func udpDaemonHandle(connect *net.UDPConn) {
 					ackWithPayload(addr.IP.String(), header.Seq, update, flag, reserved)
 				}
 
-			} else if header.Type&MemUpdateJoin != 0 {
+			} else if header.Type == MemUpdateJoin {
 				Logger.Info("Handle join update sent from %s\n", addr.IP.String())
 				handleJoin(payload)
 				// Get update entry from TTL Cache
@@ -384,11 +383,9 @@ func udpDaemonHandle(connect *net.UDPConn) {
 				ack(addr.IP.String(), header.Seq, reserved)
 			}
 
-		} else if header.Type&FlagUpdate != 0 {
-
+		case FlagUpdate:
 			handleFlagUpdate(payload)
-
-		} else if header.Type&Ack != 0 {
+		case Ack:
 
 			// Receive Ack, stop ping timer
 			timer, ok := PingAckTimeout[header.Seq]
@@ -414,33 +411,34 @@ func udpDaemonHandle(connect *net.UDPConn) {
 			// Read payload
 			payload := buffer[HeaderLength:n]
 
-			if header.Type&MemInitReply != 0 {
+			if header.Type == MemInitReply {
 				// Ack carries Init Reply, stop init timer
-				stop := init_timer.Stop()
-				if stop {
+				if stop := init_timer.Stop(); stop {
 					Logger.Info("Receive Init Reply from [%s] with %d\n", addr.IP.String(), header.Seq)
 				}
 				handleInitReply(payload)
 
-			} else if header.Type&MemUpdateSuspect != 0 {
+			} else if header.Type == MemUpdateSuspect {
 				Logger.Info("Handle suspect update sent from %s\n", addr.IP.String())
 				handleSuspect(payload)
 
-			} else if header.Type&MemUpdateResume != 0 {
+			} else if header.Type == MemUpdateResume {
 				Logger.Info("Handle resume update sent from %s\n", addr.IP.String())
 				handleResume(payload)
 
-			} else if header.Type&MemUpdateLeave != 0 {
+			} else if header.Type == MemUpdateLeave {
 				Logger.Info("Handle leave update sent from %s\n", addr.IP.String())
 				handleLeave(payload)
 
-			} else if header.Type&MemUpdateJoin != 0 {
+			} else if header.Type == MemUpdateJoin {
 				Logger.Info("Handle join update sent from %s\n", addr.IP.String())
 				handleJoin(payload)
 
 			} else {
 				Logger.Info("Receive pure ack sent from %s\n", addr.IP.String())
 			}
+		default:
+			Logger.Error("Unknown message type: %d", header.Type)
 		}
 	}
 }
