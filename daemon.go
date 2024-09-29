@@ -663,6 +663,10 @@ func pingWithPayload(member *Member, payload []byte, flag uint8) {
 		Logger.Info("Ping (%s, %d) timeout\n", addr, seq)
 		err := CurrentList.Update(member.TimeStamp, member.IP, StateSuspect)
 		if err == nil {
+			fmt.Printf("[SUSPECTED NODE] Node with IP: %s and Timestamp: %d is suspected by this node\n",
+				int2ip(member.IP).String(), member.TimeStamp)
+			Logger.Info("[SUSPECTED NODE] Node with IP: %s and Timestamp: %d is suspected by this node\n",
+				int2ip(member.IP).String(), member.TimeStamp)
 			addUpdate2Cache(member, MemUpdateSuspect)
 		}
 		delete(PingAckTimeout, uint16(seq))
