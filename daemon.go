@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-
-	// "log"
 	"math/rand"
 	"net"
 	"os"
@@ -13,21 +11,30 @@ import (
 	"time"
 )
 
+// Constants for message types
 const (
-	Ping             = 1
-	Ack              = 2
-	MemInitRequest   = 3
-	MemInitReply     = 4
-	MemUpdateSuspect = 5
-	MemUpdateResume  = 6
-	MemUpdateLeave   = 7
-	MemUpdateJoin    = 8
-	FlagUpdate       = 9
+	MessageTypePing           = 1
+	MessageTypeAck            = 2
+	MessageTypeMemInitRequest = 3
+	MessageTypeMemInitReply   = 4
+	MessageTypeUpdate         = 5
+	MessageTypeFlagUpdate     = 6
+)
 
-	StateAlive         = 0x01
-	StateSuspect       = 0x01 << 1
-	StateMonit         = 0x01 << 2
-	StateIntro         = 0x01 << 3
+// Constants for update types
+const (
+	UpdateTypeSuspect = 1
+	UpdateTypeResume  = 2
+	UpdateTypeLeave   = 3
+	UpdateTypeJoin    = 4
+)
+
+const (
+	StateAlive   = 0x01
+	StateSuspect = 0x02
+	StateMonit   = 0x04
+	StateIntro   = 0x08
+
 	IntroducerIP       = "172.22.95.32"
 	Port               = ":6666"
 	InitTimeoutPeriod  = 2000 * time.Millisecond
@@ -198,7 +205,7 @@ func udpDaemon() {
 	wg.Wait()
 }
 
-// Concurrently read user input by chanel
+// Concurrently read user input by channel
 func readCommand(input chan<- string) {
 	for {
 		var cmd string
@@ -212,7 +219,7 @@ func readCommand(input chan<- string) {
 
 func initiateLeave() {
 	uid := TTLCaches.RandGen.Uint64()
-	update := Update{uid, TTL_, MemUpdateLeave, CurrentMember.TimeStamp, CurrentMember.IP, CurrentMember.State}
+	update := Update{uid, TTL_, UpdateTypeLeave, CurrentMember.TimeStamp, CurrentMember.IP, CurrentMember.State}
 	// Clear current ttl cache and add delete update to the cache
 	TTLCaches = NewTtlCache()
 	TTLCaches.Set(&update)
@@ -225,20 +232,20 @@ func initiateLeave() {
 func periodicPingIntroducer() {
 	for {
 		global_wg.Wait() // Once leave, Do not execute this function
-		// Periodiclly ping introducer when introducer is failed.
-		// Piggyback it's self member info
+		// Periodically ping introducer when introducer is failed.
+		// Piggyback its own member info
 		// Use for introducer revive
 		if (CurrentList.Size() > 0) && (!CurrentList.ContainsIP(ip2int(net.ParseIP(IntroducerIP)))) && (LocalIP != IntroducerIP) {
 			// Construct a join update
 			uid := TTLCaches.RandGen.Uint64()
-			update := Update{uid, TTL_, MemUpdateJoin, CurrentMember.TimeStamp, CurrentMember.IP, CurrentMember.State}
+			update := Update{uid, TTL_, UpdateTypeJoin, CurrentMember.TimeStamp, CurrentMember.IP, CurrentMember.State}
 			isUpdateDuplicate(uid)
 			// Construct a buffer to carry binary update struct
 			var updateBuffer bytes.Buffer
 			binary.Write(&updateBuffer, binary.BigEndian, &update)
 			// Send piggyback Join Update
 			Logger.Info("Introducer failed, try to ping introducer\n")
-			pingWithPayload(&Member{0, ip2int(net.ParseIP(IntroducerIP)), 0}, updateBuffer.Bytes(), MemUpdateJoin)
+			pingWithPayload(&Member{0, ip2int(net.ParseIP(IntroducerIP)), 0}, updateBuffer.Bytes())
 		}
 
 		// Ping introducer period
@@ -260,13 +267,13 @@ func periodicPing() {
 			}
 			Logger.Info("Member (%d, %d) is selected by shuffling\n", member.TimeStamp, member.IP)
 			// Get update entry from TTL Cache
-			update, flag, err := getUpdate()
+			updatePayload, err := getUpdatePayload()
 			// if no update there, do pure ping
 			if err != nil {
 				ping(member)
 			} else {
 				// Send update as payload of ping
-				pingWithPayload(member, update, flag)
+				pingWithPayload(member, updatePayload)
 			}
 		}
 		time.Sleep(PingSendingPeriod)
@@ -276,12 +283,12 @@ func periodicPing() {
 func udpDaemonHandle(connect *net.UDPConn) {
 	for {
 		global_wg.Wait() // Once leave, stop receiving messages
-		// Making a buffer to accept the grep command content from client
+		// Making a buffer to accept the command content from client
 		buffer := make([]byte, 1024)
 		n, addr, err := connect.ReadFromUDP(buffer)
 		printError(err)
 
-		// Seperate header and payload
+		// Separate header and payload
 		const HeaderLength = 4 // Header Length 4 bytes
 
 		// Read header
@@ -294,149 +301,20 @@ func udpDaemonHandle(connect *net.UDPConn) {
 		// Read payload
 		payload := buffer[HeaderLength:n]
 
-		// Resume detection
+		// Handle messages based on their type
 		switch header.Type {
-		case Ping:
-			reserved := uint8(0x00)
-			// Check whether this ping's source IP is within the memberlist
-			// IF not, set reserved 0xff, ask for sender's join update
-			// init request will not participate this procedure
-			// Because every new join member is unknown to the introducer
-			if (!CurrentList.ContainsIP(ip2int(addr.IP))) && (header.Type == MemInitRequest) {
-				reserved = 0xff
-				Logger.Info("Receive ping from unknown member, set reserved field 0xff")
-			}
-
-			// Check whether this ping carries Init Request
-			if header.Type == MemInitRequest {
-				// Handle Init Request
-				Logger.Info("Receive Init Request from %s: with seq %d\n", addr.IP.String(), header.Seq)
-				initReply(addr.IP.String(), header.Seq, payload)
-
-			} else if header.Type == MemUpdateSuspect {
-				reserved := uint8(0x00)
-				// 检查是否是怀疑更新消息，并且是否需要进入怀疑机制
-				if header.Type == MemUpdateSuspect {
-					// 如果怀疑机制被禁用，直接将节点标记为失败
-					if !suspectOn {
-						Logger.Info("Skipping suspicion mechanism and marking node as failed")
-						handleLeave(payload) // 将节点标记为失败
-					} else {
-						Logger.Info("Handle suspect update sent from %s\n", addr.IP.String())
-						handleSuspect(payload)
-						// Get update entry from TTL Cache
-						update, flag, err := getUpdate()
-						// if no update there, do pure ping
-						if err != nil {
-							ack(addr.IP.String(), header.Seq, reserved)
-						} else {
-							// Send update as payload of ping
-							ackWithPayload(addr.IP.String(), header.Seq, update, flag, reserved)
-						}
-					}
-				}
-
-			} else if header.Type == MemUpdateResume {
-				Logger.Info("Handle resume update sent from %s\n", addr.IP.String())
-				handleResume(payload)
-				// Get update entry from TTL Cache
-				update, flag, err := getUpdate()
-				// if no update there, do pure ping
-				if err != nil {
-					ack(addr.IP.String(), header.Seq, reserved)
-				} else {
-					// Send update as payload of ping
-					ackWithPayload(addr.IP.String(), header.Seq, update, flag, reserved)
-				}
-
-			} else if header.Type == MemUpdateLeave {
-				Logger.Info("Handle leave update sent from %s\n", addr.IP.String())
-				handleLeave(payload)
-				// Get update entry from TTL Cache
-				update, flag, err := getUpdate()
-				// if no update there, do pure ping
-				if err != nil {
-					ack(addr.IP.String(), header.Seq, reserved)
-				} else {
-					// Send update as payload of ping
-					ackWithPayload(addr.IP.String(), header.Seq, update, flag, reserved)
-				}
-
-			} else if header.Type == MemUpdateJoin {
-				Logger.Info("Handle join update sent from %s\n", addr.IP.String())
-				handleJoin(payload)
-				// Get update entry from TTL Cache
-				update, flag, err := getUpdate()
-				// if no update there, do pure ping
-				if err != nil {
-					ack(addr.IP.String(), header.Seq, reserved)
-				} else {
-					// Send update as payload of ping
-					ackWithPayload(addr.IP.String(), header.Seq, update, flag, reserved)
-				}
-
-			} else {
-				// Ping with no payload,
-				// No handling payload needed
-				// Check whether update sending needed
-				// If no, simply reply with ack
-				ack(addr.IP.String(), header.Seq, reserved)
-			}
-
-		case FlagUpdate:
+		case MessageTypePing:
+			handlePing(header, addr, payload)
+		case MessageTypeAck:
+			handleAck(header, addr, payload)
+		case MessageTypeMemInitRequest:
+			handleMemInitRequest(header, addr, payload)
+		case MessageTypeMemInitReply:
+			handleMemInitReply(header, addr, payload)
+		case MessageTypeUpdate:
+			handleUpdate(header, addr, payload)
+		case MessageTypeFlagUpdate:
 			handleFlagUpdate(payload)
-		case Ack:
-
-			// Receive Ack, stop ping timer
-			timer, ok := PingAckTimeout[header.Seq]
-			if ok && timer != nil {
-				timer.Stop()
-				Logger.Info("Receive ACK from [%s] with seq %d\n", addr.IP.String(), header.Seq)
-				delete(PingAckTimeout, header.Seq)
-			} else {
-				Logger.Debug("Attempted to stop a non-existent or nil timer for seq %d\n", header.Seq)
-			}
-
-			// Check header's reserved field
-			// If reserved field is 0xff, means this handler is missing in someone else's memberlist,
-			// Hence disseminate join update
-			if header.Reserved == 0xff {
-				uid := TTLCaches.RandGen.Uint64()
-				update := Update{uid, TTL_, MemUpdateJoin, CurrentMember.TimeStamp, CurrentMember.IP, CurrentMember.State}
-				TTLCaches.Set(&update)
-				isUpdateDuplicate(uid)
-				Logger.Info("Receive header with reserved 0xff, disseminate join update")
-			}
-
-			// Read payload
-			payload := buffer[HeaderLength:n]
-
-			if header.Type == MemInitReply {
-				// Ack carries Init Reply, stop init timer
-				if stop := init_timer.Stop(); stop {
-					Logger.Info("Receive Init Reply from [%s] with %d\n", addr.IP.String(), header.Seq)
-				}
-				handleInitReply(payload)
-
-			} else if header.Type == MemUpdateSuspect {
-				Logger.Info("Handle suspect update sent from %s\n", addr.IP.String())
-				handleSuspect(payload)
-
-			} else if header.Type == MemUpdateResume {
-				Logger.Info("Handle resume update sent from %s\n", addr.IP.String())
-				handleResume(payload)
-
-			} else if header.Type == MemUpdateLeave {
-				Logger.Info("Handle leave update sent from %s\n", addr.IP.String())
-				handleLeave(payload)
-
-			} else if header.Type == MemUpdateJoin {
-				Logger.Info("Handle join update sent from %s\n", addr.IP.String())
-				handleJoin(payload)
-
-			} else {
-				Logger.Info("Receive pure ack sent from %s\n", addr.IP.String())
-			}
 		default:
 			Logger.Error("Unknown message type: %d", header.Type)
 		}
@@ -444,16 +322,15 @@ func udpDaemonHandle(connect *net.UDPConn) {
 }
 
 // Check whether the update is duplicated
-// If duplicated, return false, else, return true and start a timer
+// If duplicated, return true, else, return false and start a timer
 func isUpdateDuplicate(id uint64) bool {
 	mutex.Lock()
 	_, ok := DuplicateUpdateCaches[id]
-	mutex.Unlock()
 	if ok {
+		mutex.Unlock()
 		Logger.Info("Receive duplicated update %d\n", id)
 		return true
 	} else {
-		mutex.Lock()
 		DuplicateUpdateCaches[id] = 1 // add to cache
 		mutex.Unlock()
 		Logger.Info("Add update %d to duplicated cache table \n", id)
@@ -462,121 +339,190 @@ func isUpdateDuplicate(id uint64) bool {
 			<-recent_update_timer.C
 			mutex.Lock()
 			_, ok := DuplicateUpdateCaches[id]
-			mutex.Unlock()
 			if ok {
-				mutex.Lock()
 				delete(DuplicateUpdateCaches, id) // delete from cache
-				mutex.Unlock()
 				Logger.Info("Delete update %d from duplicated cache table \n", id)
 			}
+			mutex.Unlock()
 		}()
 		return false
 	}
 }
 
-func getUpdate() ([]byte, uint8, error) {
+func getUpdatePayload() ([]byte, error) {
 	var binBuffer bytes.Buffer
 
 	update, err := TTLCaches.Get()
 	if err != nil {
-		return binBuffer.Bytes(), 0, err
+		return nil, err
 	}
 
 	binary.Write(&binBuffer, binary.BigEndian, update)
-	return binBuffer.Bytes(), update.UpdateType, nil
+	return binBuffer.Bytes(), nil
 }
 
-func handleSuspect(payload []byte) {
-	buf := bytes.NewReader(payload)
-	var update Update
-	err := binary.Read(buf, binary.BigEndian, &update)
-	printError(err)
+func handlePing(header Header, addr *net.UDPAddr, payload []byte) {
+	reserved := uint8(0x00)
+	senderIP := ip2int(addr.IP)
 
-	// Retrieve update ID
-	updateID := update.UpdateID
-	if !isUpdateDuplicate(updateID) {
-		// If find someone sends suspect update which
-		// suspect self, tell them I am alvie
-		if CurrentMember.TimeStamp == update.MemberTimeStamp && CurrentMember.IP == update.MemberIP {
-			addUpdate2Cache(CurrentMember, MemUpdateResume)
-			return
-		}
-		// Receive new update, handle it
-		CurrentList.Update(update.MemberTimeStamp, update.MemberIP, update.MemberState)
+	// Check whether this ping's source IP is within the member list
+	if !CurrentList.ContainsIP(senderIP) {
+		reserved = 0xff
+		Logger.Info("Received ping from unknown member, set reserved field 0xff")
+	}
+
+	if len(payload) > 0 {
+		// Handle the payload as an update
+		handleUpdate(header, addr, payload)
+	}
+
+	ack(addr.IP.String(), header.Seq, reserved)
+}
+
+func handleAck(header Header, addr *net.UDPAddr, payload []byte) {
+	timer, ok := PingAckTimeout[header.Seq]
+	if ok && timer != nil {
+		timer.Stop()
+		Logger.Info("Receive ACK from [%s] with seq %d\n", addr.IP.String(), header.Seq)
+		delete(PingAckTimeout, header.Seq)
+	} else {
+		Logger.Debug("Attempted to stop a non-existent or nil timer for seq %d\n", header.Seq)
+	}
+
+	// Check header's reserved field
+	if header.Reserved == 0xff {
+		// Disseminate join update
+		uid := TTLCaches.RandGen.Uint64()
+		update := Update{uid, TTL_, UpdateTypeJoin, CurrentMember.TimeStamp, CurrentMember.IP, CurrentMember.State}
 		TTLCaches.Set(&update)
-		failure_timer := time.NewTimer(SuspectPeriod)
-		FailureTimeout[[2]uint64{update.MemberTimeStamp, uint64(update.MemberIP)}] = failure_timer
-		go func() {
-			<-failure_timer.C
-			Logger.Info("[Failure Detected](%s, %d) Failed, detected by others\n", int2ip(update.MemberIP).String(), update.MemberTimeStamp)
-			err := CurrentList.Delete(update.MemberTimeStamp, update.MemberIP)
-			printError(err)
-			delete(FailureTimeout, [2]uint64{update.MemberTimeStamp, uint64(update.MemberIP)})
-		}()
+		isUpdateDuplicate(uid)
+		Logger.Info("Received ACK with reserved 0xff, disseminate join update")
+	}
 
+	if len(payload) > 0 {
+		// Handle the payload as an update
+		handleUpdate(header, addr, payload)
 	}
 }
 
-func handleResume(payload []byte) {
-	buf := bytes.NewReader(payload)
+func handleMemInitRequest(header Header, addr *net.UDPAddr, payload []byte) {
+	Logger.Info("Receive Init Request from %s: with seq %d\n", addr.IP.String(), header.Seq)
+	initReply(addr.IP.String(), header.Seq, payload)
+}
+
+func handleMemInitReply(header Header, addr *net.UDPAddr, payload []byte) {
+	if stop := init_timer.Stop(); stop {
+		Logger.Info("Receive Init Reply from [%s] with %d\n", addr.IP.String(), header.Seq)
+	}
+	handleInitReply(payload)
+}
+
+func handleUpdate(header Header, addr *net.UDPAddr, payload []byte) {
 	var update Update
+	buf := bytes.NewReader(payload)
 	err := binary.Read(buf, binary.BigEndian, &update)
 	printError(err)
 
-	// Retrieve update ID
-	updateID := update.UpdateID
-	if !isUpdateDuplicate(updateID) {
-		// Receive new update, handle it
-		timer, ok := FailureTimeout[[2]uint64{update.MemberTimeStamp, uint64(update.MemberIP)}]
-		if ok {
-			timer.Stop()
-			delete(FailureTimeout, [2]uint64{update.MemberTimeStamp, uint64(update.MemberIP)})
-		}
-		err := CurrentList.Update(update.MemberTimeStamp, update.MemberIP, update.MemberState)
-		// If the resume target is not in the list, insert it to the list
-		if err != nil {
-			CurrentList.Insert(&Member{update.MemberTimeStamp, update.MemberIP, update.MemberState})
-		}
-		TTLCaches.Set(&update)
+	switch update.UpdateType {
+	case UpdateTypeSuspect:
+		handleSuspectUpdate(&update)
+	case UpdateTypeResume:
+		handleResumeUpdate(&update)
+	case UpdateTypeLeave:
+		handleLeaveUpdate(&update)
+	case UpdateTypeJoin:
+		handleJoinUpdate(&update)
+	default:
+		Logger.Error("Unknown update type: %d", update.UpdateType)
 	}
 }
 
-func handleLeave(payload []byte) {
-	buf := bytes.NewReader(payload)
+func handleFlagUpdate(payload []byte) {
 	var update Update
+	buf := bytes.NewReader(payload)
 	err := binary.Read(buf, binary.BigEndian, &update)
 	printError(err)
 
-	// Retrieve update ID
-	updateID := update.UpdateID
-	if !isUpdateDuplicate(updateID) {
-		// Receive new update, handle it
-		CurrentList.Delete(update.MemberTimeStamp, update.MemberIP)
-		TTLCaches.Set(&update)
+	// Update suspicion mechanism status
+	if update.MemberState == 1 {
+		suspectOn = true
+		fmt.Println("Suspicion mechanism enabled (received from another node).")
+	} else {
+		suspectOn = false
+		fmt.Println("Suspicion mechanism disabled (received from another node).")
 	}
 }
 
-func handleJoin(payload []byte) {
-	buf := bytes.NewReader(payload)
-	var update Update
-	err := binary.Read(buf, binary.BigEndian, &update)
-	printError(err)
+func handleSuspectUpdate(update *Update) {
+	if isUpdateDuplicate(update.UpdateID) {
+		return
+	}
+	// If the suspect update is about ourselves
+	if CurrentMember.TimeStamp == update.MemberTimeStamp && CurrentMember.IP == update.MemberIP {
+		addUpdate2Cache(CurrentMember, UpdateTypeResume)
+		return
+	}
+	// Update member state to suspect
+	CurrentList.Update(update.MemberTimeStamp, update.MemberIP, StateSuspect)
+	TTLCaches.Set(update)
+	// Start failure timer
+	failure_timer := time.NewTimer(SuspectPeriod)
+	FailureTimeout[[2]uint64{update.MemberTimeStamp, uint64(update.MemberIP)}] = failure_timer
+	go func() {
+		<-failure_timer.C
+		Logger.Info("[Failure Detected](%s, %d) Failed, detected by others\n", int2ip(update.MemberIP).String(), update.MemberTimeStamp)
+		err := CurrentList.Delete(update.MemberTimeStamp, update.MemberIP)
+		printError(err)
+		delete(FailureTimeout, [2]uint64{update.MemberTimeStamp, uint64(update.MemberIP)})
+	}()
+}
 
-	// Retrieve update ID
-	updateID := update.UpdateID
-	if !isUpdateDuplicate(updateID) {
-		// Receive new update, handle it
-		CurrentList.Insert(&Member{update.MemberTimeStamp, update.MemberIP,
-			update.MemberState})
-		TTLCaches.Set(&update)
-		// Introducer diseeminate its info when receives join
-		if LocalIP == IntroducerIP {
-			uid := TTLCaches.RandGen.Uint64()
-			reply_update := Update{uid, TTL_, MemUpdateJoin, CurrentMember.TimeStamp, CurrentMember.IP, CurrentMember.State}
-			TTLCaches.Set(&reply_update)
-			isUpdateDuplicate(uid)
-			Logger.Info("Introducer set its info update to the cache\n")
+func handleResumeUpdate(update *Update) {
+	if isUpdateDuplicate(update.UpdateID) {
+		return
+	}
+	// Cancel failure timer if exists
+	timer, ok := FailureTimeout[[2]uint64{update.MemberTimeStamp, uint64(update.MemberIP)}]
+	if ok {
+		timer.Stop()
+		delete(FailureTimeout, [2]uint64{update.MemberTimeStamp, uint64(update.MemberIP)})
+	}
+	// Update member state to alive
+	err := CurrentList.Update(update.MemberTimeStamp, update.MemberIP, update.MemberState)
+	if err != nil {
+		CurrentList.Insert(&Member{update.MemberTimeStamp, update.MemberIP, update.MemberState})
+	}
+	TTLCaches.Set(update)
+}
+
+func handleLeaveUpdate(update *Update) {
+	if isUpdateDuplicate(update.UpdateID) {
+		return
+	}
+	CurrentList.Delete(update.MemberTimeStamp, update.MemberIP)
+	TTLCaches.Set(update)
+}
+
+func handleJoinUpdate(update *Update) {
+	if isUpdateDuplicate(update.UpdateID) {
+		return
+	}
+	CurrentList.Insert(&Member{update.MemberTimeStamp, update.MemberIP, update.MemberState})
+	TTLCaches.Set(update)
+	// If this node is the introducer, disseminate its info
+	if LocalIP == IntroducerIP {
+		uid := TTLCaches.RandGen.Uint64()
+		reply_update := Update{
+			UpdateID:        uid,
+			TTL:             TTL_,
+			UpdateType:      UpdateTypeJoin,
+			MemberTimeStamp: CurrentMember.TimeStamp,
+			MemberIP:        CurrentMember.IP,
+			MemberState:     CurrentMember.State,
 		}
+		TTLCaches.Set(&reply_update)
+		isUpdateDuplicate(uid)
+		Logger.Info("Introducer set its info update to the cache\n")
 	}
 }
 
@@ -605,30 +551,28 @@ func handleInitReply(payload []byte) {
 // Introducer replies new node join init request and
 // send the new node join updates to others in membership
 func initReply(addr string, seq uint16, payload []byte) {
-	// Read and insert new member to the memberlist
+	// Read and insert new member to the member list
 	var member Member
 	buf := bytes.NewReader(payload)
 	err := binary.Read(buf, binary.BigEndian, &member)
 	printError(err)
-	// Update state of the new member
-	// ...
 	CurrentList.Insert(&member)
-	addUpdate2Cache(&member, MemUpdateJoin)
+	addUpdate2Cache(&member, UpdateTypeJoin)
 
-	// Put the entire memberlist to the Init Reply's payload
-	var memBuffer bytes.Buffer // Temp buf to store member's binary value
+	// Prepare the entire member list as payload
 	var binBuffer bytes.Buffer
-
-	for i := 0; i < CurrentList.Size(); i += 1 {
+	for i := 0; i < CurrentList.Size(); i++ {
 		member_, _ := CurrentList.RetrieveByIdx(i)
-
-		binary.Write(&memBuffer, binary.BigEndian, member_)
-		binBuffer.Write(memBuffer.Bytes())
-		memBuffer.Reset() // Clear buffer
+		binary.Write(&binBuffer, binary.BigEndian, member_)
 	}
 
-	// Send pigggback Init Reply
-	ackWithPayload(addr, seq, binBuffer.Bytes(), MemInitReply, 0x00)
+	// Send Init Reply
+	packet := Header{MessageTypeMemInitReply, seq, 0}
+	var msgBuffer bytes.Buffer
+	binary.Write(&msgBuffer, binary.BigEndian, packet)
+	msgBuffer.Write(binBuffer.Bytes())
+
+	udpSend(addr+Port, msgBuffer.Bytes())
 }
 
 func initRequest(member *Member) {
@@ -636,10 +580,15 @@ func initRequest(member *Member) {
 	var binBuffer bytes.Buffer
 	binary.Write(&binBuffer, binary.BigEndian, member)
 
-	// Send piggyback Init Request
-	pingWithPayload(&Member{0, ip2int(net.ParseIP(IntroducerIP)), 0}, binBuffer.Bytes(), MemInitRequest)
+	// Send Init Request
+	packet := Header{MessageTypeMemInitRequest, 0, 0}
+	var msgBuffer bytes.Buffer
+	binary.Write(&msgBuffer, binary.BigEndian, packet)
+	msgBuffer.Write(binBuffer.Bytes())
 
-	// Start Init timer, if expires, exit process
+	udpSend(IntroducerIP+Port, msgBuffer.Bytes())
+
+	// Start Init timer
 	init_timer = time.NewTimer(InitTimeoutPeriod)
 	go func() {
 		<-init_timer.C
@@ -648,8 +597,8 @@ func initRequest(member *Member) {
 	}()
 }
 
-func ackWithPayload(addr string, seq uint16, payload []byte, flag uint8, reserved uint8) {
-	packet := Header{Ack | flag, seq, reserved}
+func ackWithPayload(addr string, seq uint16, payload []byte, reserved uint8) {
+	packet := Header{MessageTypeAck, seq, reserved}
 	var binBuffer bytes.Buffer
 	binary.Write(&binBuffer, binary.BigEndian, packet)
 
@@ -660,76 +609,59 @@ func ackWithPayload(addr string, seq uint16, payload []byte, flag uint8, reserve
 }
 
 func ack(addr string, seq uint16, reserved uint8) {
-	ackWithPayload(addr, seq, nil, 0x00, reserved)
+	ackWithPayload(addr, seq, nil, reserved)
 }
 
-func pingWithPayload(member *Member, payload []byte, flag uint8) {
-	// Source for genearting random number
-	randSource := rand.NewSource(time.Now().UnixNano())
-	randGen := rand.New(randSource)
-	seq := randGen.Intn(0x01<<15 - 2)
+func pingWithPayload(member *Member, payload []byte) {
+	// Generate a sequence number
+	seq := uint16(rand.Uint32())
 	addr := int2ip(member.IP).String() + Port
 
-	packet := Header{Ping | flag, uint16(seq), 0}
+	packet := Header{MessageTypePing, seq, 0}
 	var binBuffer bytes.Buffer
 	binary.Write(&binBuffer, binary.BigEndian, packet)
 
 	if payload != nil {
 		binBuffer.Write(payload) // Append payload
-		udpSend(addr, binBuffer.Bytes())
-	} else {
-		udpSend(addr, binBuffer.Bytes())
 	}
+	udpSend(addr, binBuffer.Bytes())
 	Logger.Info("Ping (%s, %d)\n", addr, seq)
 
 	timer := time.NewTimer(PingTimeoutPeriod)
-	PingAckTimeout[uint16(seq)] = timer
+	PingAckTimeout[seq] = timer
 	go func() {
 		<-timer.C
 		Logger.Info("Ping (%s, %d) timeout\n", addr, seq)
+		handlePingTimeout(member)
+		delete(PingAckTimeout, seq)
+	}()
+}
 
-		if !suspectOn {
-			// 怀疑机制关闭时，直接将节点标记为失败并删除
-			fmt.Printf("[FAILURE DETECTED] Node with IP: %s and Timestamp: %d is marked as failed directly.\n",
+func handlePingTimeout(member *Member) {
+	if !suspectOn {
+		// Suspicion mechanism is disabled, directly mark node as failed
+		fmt.Printf("[FAILURE DETECTED] Node with IP: %s and Timestamp: %d is marked as failed directly.\n",
+			int2ip(member.IP).String(), member.TimeStamp)
+		Logger.Info("[FAILURE DETECTED] Node with IP: %s and Timestamp: %d is marked as failed directly.\n",
+			int2ip(member.IP).String(), member.TimeStamp)
+
+		// Delete the node
+		err := CurrentList.Delete(member.TimeStamp, member.IP)
+		printError(err)
+	} else {
+		// Suspicion mechanism is enabled, mark node as suspect
+		err := CurrentList.Update(member.TimeStamp, member.IP, StateSuspect)
+		if err == nil {
+			fmt.Printf("[SUSPECTED NODE] Node with IP: %s and Timestamp: %d is suspected by this node\n",
 				int2ip(member.IP).String(), member.TimeStamp)
-			Logger.Info("[FAILURE DETECTED] Node with IP: %s and Timestamp: %d is marked as failed directly.\n",
+			Logger.Info("[SUSPECTED NODE] Node with IP: %s and Timestamp: %d is suspected by this node\n",
 				int2ip(member.IP).String(), member.TimeStamp)
 
-			// 删除该节点
-			err := CurrentList.Delete(member.TimeStamp, member.IP)
-			printError(err)
-		} else {
-			// 怀疑机制开启时，标记节点为 Suspect，并进入怀疑检测流程
-			err := CurrentList.Update(member.TimeStamp, member.IP, StateSuspect)
-			if err == nil {
-				fmt.Printf("[SUSPECTED NODE] Node with IP: %s and Timestamp: %d is suspected by this node\n",
-					int2ip(member.IP).String(), member.TimeStamp)
-				Logger.Info("[SUSPECTED NODE] Node with IP: %s and Timestamp: %d is suspected by this node\n",
-					int2ip(member.IP).String(), member.TimeStamp)
-
-				// 将怀疑状态更新加入到 TTL 缓存并广播
-				addUpdate2Cache(member, MemUpdateSuspect)
-			}
-
-			// 设置一个本地怀疑超时计时器，超时后标记为失败
-			failure_timer := time.NewTimer(SuspectPeriod)
-			FailureTimeout[[2]uint64{member.TimeStamp, uint64(member.IP)}] = failure_timer
-			go func() {
-				// 等待怀疑超时
-				<-failure_timer.C
-				Logger.Info("[Failure Detected](%s, %d) Failed, detected by self\n", int2ip(member.IP).String(), member.TimeStamp)
-
-				// 删除节点
-				err := CurrentList.Delete(member.TimeStamp, member.IP)
-				printError(err)
-
-				// 清除超时记录
-				delete(FailureTimeout, [2]uint64{member.TimeStamp, uint64(member.IP)})
-			}()
+			// Add suspect update to TTL cache and broadcast
+			addUpdate2Cache(member, UpdateTypeSuspect)
 		}
 
-		delete(PingAckTimeout, uint16(seq))
-		// Handle local suspect timeout
+		// Set a local suspicion timeout timer, after which the node is marked as failed
 		failure_timer := time.NewTimer(SuspectPeriod)
 		FailureTimeout[[2]uint64{member.TimeStamp, uint64(member.IP)}] = failure_timer
 		go func() {
@@ -739,22 +671,22 @@ func pingWithPayload(member *Member, payload []byte, flag uint8) {
 			printError(err)
 			delete(FailureTimeout, [2]uint64{member.TimeStamp, uint64(member.IP)})
 		}()
-	}()
+	}
 }
 
 func ping(member *Member) {
-	pingWithPayload(member, nil, 0x00)
+	pingWithPayload(member, nil)
 }
 
-// 广播怀疑机制状态变化
+// Broadcast suspicion mechanism status change
 func broadcastFlagChange(flagStatus bool) {
-	// 将状态转换为 uint8 (1 表示启用，0 表示禁用)
+	// Convert status to uint8 (1 for enabled, 0 for disabled)
 	flagValue := uint8(0)
 	if flagStatus {
 		flagValue = 1
 	}
 
-	// 向所有其他成员广播 flag 更新消息
+	// Send FlagUpdate message to all other members
 	for _, member := range CurrentList.Members {
 		if member != nil && member.IP != CurrentMember.IP {
 			Logger.Info("Sending FlagUpdate to %s", int2ip(member.IP).String())
@@ -763,43 +695,26 @@ func broadcastFlagChange(flagStatus bool) {
 	}
 }
 
-// 发送 FlagUpdate 消息
+// Send FlagUpdate message
 func sendFlagUpdate(member *Member, flagValue uint8) {
 	// Construct the FlagUpdate message
 	update := Update{
 		UpdateID:        TTLCaches.RandGen.Uint64(),
 		TTL:             TTL_,
-		UpdateType:      FlagUpdate,
+		UpdateType:      0, // Not used for FlagUpdate
 		MemberTimeStamp: CurrentMember.TimeStamp,
 		MemberIP:        CurrentMember.IP,
 		MemberState:     flagValue, // Store suspicion mechanism status in MemberState
 	}
 
 	// Include a header in the message
-	packet := Header{FlagUpdate, 0, 0}
+	packet := Header{MessageTypeFlagUpdate, 0, 0}
 	var binBuffer bytes.Buffer
 	binary.Write(&binBuffer, binary.BigEndian, packet)
 	binary.Write(&binBuffer, binary.BigEndian, &update)
 
 	// Send the FlagUpdate message
 	udpSend(int2ip(member.IP).String()+Port, binBuffer.Bytes())
-}
-
-// 处理 FlagUpdate 消息，更新怀疑机制状态
-func handleFlagUpdate(payload []byte) {
-	var update Update
-	buf := bytes.NewReader(payload)
-	err := binary.Read(buf, binary.BigEndian, &update)
-	printError(err)
-
-	// 更新怀疑机制状态
-	if update.MemberState == 1 {
-		suspectOn = true
-		fmt.Println("Suspicion mechanism enabled (received from another node).")
-	} else {
-		suspectOn = false
-		fmt.Println("Suspicion mechanism disabled (received from another node).")
-	}
 }
 
 // Start the membership service and join in the group
@@ -827,7 +742,7 @@ func initilize() bool {
 func main() {
 
 	// Init
-	if initilize() == true {
+	if initilize() {
 		fmt.Printf("[INFO]: Start service\n")
 	}
 	// Start daemon
