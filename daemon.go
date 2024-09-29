@@ -59,6 +59,7 @@ var FailureTimeout map[[2]uint64]*time.Timer
 var CurrentMember *Member
 var CurrentList *MemberList
 var LocalIP string
+var suspectOn bool
 
 var DuplicateUpdateCaches map[uint64]uint8
 var TTLCaches *TtlCache
@@ -150,10 +151,10 @@ func udpDaemon() {
 				initRequest(CurrentMember)
 			}
 
-		case "showlist":
+		case "list_mem":
 			CurrentList.PrintMemberList()
 
-		case "showid":
+		case "list_self":
 			fmt.Printf("Member (%d, %s)\n", CurrentMember.TimeStamp, LocalIP)
 
 		case "leave":
@@ -163,6 +164,11 @@ func udpDaemon() {
 			}
 			global_wg.Add(1)
 			initiateLeave()
+		case "enable_sus":
+			suspectOn = true
+
+		case "disable_sus":
+			suspectOn = false
 
 		default:
 			fmt.Println("Invalid Command, Please use correct one")
@@ -170,6 +176,8 @@ func udpDaemon() {
 			fmt.Println("# showlist")
 			fmt.Println("# showid")
 			fmt.Println("# leave")
+			fmt.Println("# enable_sus")
+			fmt.Println("# disable_sus")
 		}
 	}
 
