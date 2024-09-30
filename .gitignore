@@ -27,3 +27,5 @@ go.work.sum
 *.log
 
 /script
+
+.DS_Store
