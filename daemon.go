@@ -116,13 +116,16 @@ func printError(err error) {
 func udpSend(addr string, packet []byte) {
 	conn, err := net.Dial("udp", addr)
 	printError(err)
+	// Close the connection after sending to avoid resource leak
 	defer conn.Close()
+	// Send the packet
 	conn.Write(packet)
 }
 
 // UDP Daemon loop task
 func udpDaemon() {
 	serverAddr := Port
+	// Resolve the address to net.UDPAddr
 	udpAddr, err := net.ResolveUDPAddr("udp4", serverAddr)
 	printError(err)
 	// Listen the request
@@ -131,6 +134,8 @@ func udpDaemon() {
 
 	// Use waitgroup
 	var wg sync.WaitGroup
+
+	// make sure the main thread won't exit
 	wg.Add(1)
 
 	userCmd := make(chan string)
@@ -138,15 +143,22 @@ func udpDaemon() {
 	go readCommand(userCmd)
 
 	global_wg.Add(1)
+	// open goroutine but not gonna block the main thread
+
+	// Start the daemon to handle UDP messages
 	go udpDaemonHandle(listen)
+
+	// Start the periodic ping and ping introducer goroutines
 	go periodicPing()
+
+	// Start the periodic ping introducer goroutine
 	go periodicPingIntroducer()
 
 	for {
 		s := <-userCmd
 		switch s {
 		case "join":
-			if CurrentList.Size() > 0 {
+			if CurrentList.Size() > 0 { // Already in the group
 				fmt.Println("Already in the group")
 				continue
 			}
@@ -614,6 +626,7 @@ func ack(addr string, seq uint16, reserved uint8) {
 
 func pingWithPayload(member *Member, payload []byte) {
 	// Generate a sequence number
+	fmt.Printf("Ping with payload %v, member: %v\n", payload, member)
 	seq := uint16(rand.Uint32())
 	addr := int2ip(member.IP).String() + Port
 
